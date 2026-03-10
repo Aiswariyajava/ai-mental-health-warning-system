@@ -8,14 +8,86 @@ import joblib
 import time
 import os
 import re
+import sqlite3
+from datetime import datetime
+import json
 
 # ── Page config (must be first Streamlit command) ──────────
 st.set_page_config(
     page_title="AI Mental Health Early Warning System",
     page_icon="🧠",
-    layout="centered",
+    layout="wide",
     initial_sidebar_state="expanded",
 )
+
+# ─────────────────────────────────────────────────────────────
+# HISTORY DATABASE SETUP
+# ─────────────────────────────────────────────────────────────
+DB_PATH = os.path.join(os.getcwd(), "analysis_history.db")
+
+def init_db():
+    """Initialize the SQLite database for storing analysis history."""
+    conn = sqlite3.connect(DB_PATH)
+    cursor = conn.cursor()
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS analysis_history (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            timestamp TEXT NOT NULL,
+            statement TEXT NOT NULL,
+            risk_level TEXT NOT NULL,
+            confidence REAL,
+            suggestions TEXT NOT NULL,
+            override BOOLEAN DEFAULT 0
+        )
+    """)
+    conn.commit()
+    conn.close()
+
+def save_to_history(statement: str, risk_level: str, confidence: float, suggestions: dict, override: bool = False):
+    """Save analysis result to history database."""
+    conn = sqlite3.connect(DB_PATH)
+    cursor = conn.cursor()
+    timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    suggestions_json = json.dumps(suggestions)
+    
+    cursor.execute("""
+        INSERT INTO analysis_history (timestamp, statement, risk_level, confidence, suggestions, override)
+        VALUES (?, ?, ?, ?, ?, ?)
+    """, (timestamp, statement, risk_level, confidence, suggestions_json, int(override)))
+    conn.commit()
+    conn.close()
+
+def get_history():
+    """Retrieve all analysis history records from database."""
+    conn = sqlite3.connect(DB_PATH)
+    cursor = conn.cursor()
+    cursor.execute("""
+        SELECT id, timestamp, statement, risk_level, confidence, suggestions, override 
+        FROM analysis_history 
+        ORDER BY timestamp DESC
+    """)
+    rows = cursor.fetchall()
+    conn.close()
+    return rows
+
+def delete_history_record(record_id: int):
+    """Delete a specific record from history."""
+    conn = sqlite3.connect(DB_PATH)
+    cursor = conn.cursor()
+    cursor.execute("DELETE FROM analysis_history WHERE id = ?", (record_id,))
+    conn.commit()
+    conn.close()
+
+def clear_all_history():
+    """Clear all history records."""
+    conn = sqlite3.connect(DB_PATH)
+    cursor = conn.cursor()
+    cursor.execute("DELETE FROM analysis_history")
+    conn.commit()
+    conn.close()
+
+# Initialize database on app start
+init_db()
 
 # ─────────────────────────────────────────────────────────────
 # SAFETY KEYWORDS — Hard override regardless of model output.
@@ -480,9 +552,18 @@ SUGGESTIONS = {
 
 
 # ─────────────────────────────────────────────────────────────
-# Sidebar
+# Sidebar with Navigation
 # ─────────────────────────────────────────────────────────────
 with st.sidebar:
+    # Page Navigation
+    page = st.radio(
+        "📍 Navigation",
+        ["🏠 Analyse Now", "📋 View History"],
+        horizontal=False,
+        label_visibility="collapsed"
+    )
+    
+    st.markdown("---")
     st.markdown("## 🧠 About This Tool")
     st.markdown(
         "This AI-powered system uses **Natural Language Processing (NLP)** "
@@ -516,63 +597,187 @@ with st.sidebar:
 
 
 # ─────────────────────────────────────────────────────────────
-# Main UI
+# HISTORY PAGE FUNCTION
+# ─────────────────────────────────────────────────────────────
+def display_history_page():
+    """Display the analysis history page."""
+    st.markdown("""
+    <div class="hero-banner">
+        <h1>📋 Analysis History</h1>
+        <p>Review all your past mental health assessments, risk levels, and personalized suggestions.</p>
+    </div>
+    """, unsafe_allow_html=True)
+    
+    history_records = get_history()
+    
+    if not history_records:
+        st.info("📭 No analysis history yet. Start by analyzing your mental state on the main page!")
+        return
+    
+    # Summary statistics
+    col1, col2, col3, col4 = st.columns(4)
+    
+    total_analyses = len(history_records)
+    high_risk_count = sum(1 for r in history_records if r[3] == "High")
+    medium_risk_count = sum(1 for r in history_records if r[3] == "Medium")
+    low_risk_count = sum(1 for r in history_records if r[3] == "Low")
+    
+    with col1:
+        st.metric("Total Analyses", total_analyses)
+    with col2:
+        st.metric("🚨 High Risk", high_risk_count)
+    with col3:
+        st.metric("⚠️ Medium Risk", medium_risk_count)
+    with col4:
+        st.metric("✅ Low Risk", low_risk_count)
+    
+    st.markdown("---")
+    
+    # Display history records
+    st.markdown("## 📊 Detailed History")
+    
+    # Add export and clear options
+    exp_col1, exp_col2 = st.columns([0.8, 0.2])
+    with exp_col2:
+        if st.button("🗑️ Clear All History", key="clear_history_btn"):
+            if st.session_state.get("confirm_clear", False):
+                clear_all_history()
+                st.rerun()
+            else:
+                st.session_state.confirm_clear = True
+                st.warning("Click again to confirm clearing all history")
+    
+    # Display each record
+    for idx, record in enumerate(history_records):
+        rec_id, timestamp, statement, risk_level, confidence, suggestions_json, override = record
+        
+        # Determine color class based on risk level
+        if risk_level == "High":
+            color_class = "result-high"
+            badge_class = "risk-high"
+            emoji = "🚨"
+        elif risk_level == "Medium":
+            color_class = "result-medium"
+            badge_class = "risk-medium"
+            emoji = "⚠️"
+        else:
+            color_class = "result-low"
+            badge_class = "risk-low"
+            emoji = "✅"
+        
+        # Create expandable card for each record
+        with st.expander(f"{emoji} {timestamp} — {risk_level} Risk", expanded=False):
+            col1, col2 = st.columns([0.85, 0.15])
+            
+            with col1:
+                # Statement
+                st.markdown("**📝 Statement:**")
+                st.text_area(
+                    label="Statement text",
+                    value=statement,
+                    height=100,
+                    disabled=True,
+                    key=f"statement_{rec_id}"
+                )
+                
+                # Risk Level and Confidence
+                st.markdown("**Assessment Results:**")
+                res_col1, res_col2 = st.columns(2)
+                with res_col1:
+                    st.markdown(f"**Risk Level:** <span class='risk-badge {badge_class}'>{risk_level}</span>", unsafe_allow_html=True)
+                with res_col2:
+                    if not override:
+                        st.markdown(f"**Confidence:** {confidence:.1f}%")
+                    else:
+                        st.markdown(f"**Detection:** Crisis keyword override")
+                
+                # Suggestions
+                st.markdown("**💡 Personalized Suggestions:**")
+                try:
+                    suggestions = json.loads(suggestions_json)
+                    suggestion_text = suggestions.get("intro", "")
+                    st.markdown(f"> {suggestion_text}")
+                    
+                    items = suggestions.get("items", [])
+                    if items:
+                        st.markdown("**Action items:**")
+                        for icon, text in items[:3]:  # Show first 3 items
+                            st.markdown(f"- {icon} {text}")
+                        if len(items) > 3:
+                            st.caption(f"...and {len(items) - 3} more suggestions")
+                except json.JSONDecodeError:
+                    st.markdown(f"Suggestions: {suggestions_json}")
+            
+            with col2:
+                # Delete button
+                if st.button("🗑️ Delete", key=f"delete_{rec_id}"):
+                    delete_history_record(rec_id)
+                    st.rerun()
+
+
+# ─────────────────────────────────────────────────────────────
+# Main App UI - Page Selection
 # ─────────────────────────────────────────────────────────────
 
-# Hero banner
-st.markdown("""
-<div class="hero-banner">
-    <h1>🧠 AI Mental Health Early Warning System</h1>
-    <p>Share how you're feeling. Our AI will assess your emotional state and offer personalised support.</p>
-</div>
-""", unsafe_allow_html=True)
-
-# Metric tiles
-st.markdown("""
-<div class="metric-row">
-    <div class="metric-tile"><div class="val">3</div><div class="lbl">Risk Levels</div></div>
-    <div class="metric-tile"><div class="val">NLP</div><div class="lbl">TF-IDF Engine</div></div>
-    <div class="metric-tile"><div class="val">ML</div><div class="lbl">Logistic Reg.</div></div>
-    <div class="metric-tile"><div class="val">24/7</div><div class="lbl">Always On</div></div>
-</div>
-""", unsafe_allow_html=True)
-
-# Load model (auto-trains on first run if needed)
-if not os.path.exists(os.path.join("model", "mental_health_model.pkl")):
-    with st.spinner("⚙️ Setting up model for the first time — this takes ~5 seconds..."):
-        model, vectorizer = load_artifacts()
+if page == "📋 View History":
+    display_history_page()
 else:
-    model, vectorizer = load_artifacts()
+    # MAIN ANALYSIS PAGE
+    
+    # Hero banner
+    st.markdown("""
+    <div class="hero-banner">
+        <h1>🧠 AI Mental Health Early Warning System</h1>
+        <p>Share how you're feeling. Our AI will assess your emotional state and offer personalised support.</p>
+    </div>
+    """, unsafe_allow_html=True)
 
-# Input section
-st.markdown('<div class="glass-card">', unsafe_allow_html=True)
-st.markdown("### 💬 How are you feeling today?")
+    # Metric tiles
+    st.markdown("""
+    <div class="metric-row">
+        <div class="metric-tile"><div class="val">3</div><div class="lbl">Risk Levels</div></div>
+        <div class="metric-tile"><div class="val">NLP</div><div class="lbl">TF-IDF Engine</div></div>
+        <div class="metric-tile"><div class="val">ML</div><div class="lbl">Logistic Reg.</div></div>
+        <div class="metric-tile"><div class="val">24/7</div><div class="lbl">Always On</div></div>
+    </div>
+    """, unsafe_allow_html=True)
 
-user_input = st.text_area(
-    label="Describe your thoughts, feelings, or recent experiences in your own words:",
-    placeholder=(
-        "e.g. 'I've been feeling overwhelmed lately and can't seem to relax. "
-        "My sleep has been poor and I find it hard to enjoy things...'"
-    ),
-    height=165,
-    key="user_input_area",
-)
-
-analyze_btn = st.button("🔍  Analyse My Mental State", key="analyze_btn")
-st.markdown("</div>", unsafe_allow_html=True)
-
-# ── Prediction and Results ────────────────────────────────────
-if analyze_btn:
-    if not user_input.strip():
-        st.warning("⚠️  Please enter some text before clicking Analyse.")
-    elif len(user_input.strip().split()) < 2:
-        st.warning("⚠️  Please provide a bit more detail for an accurate assessment.")
+    # Load model (auto-trains on first run if needed)
+    if not os.path.exists(os.path.join("model", "mental_health_model.pkl")):
+        with st.spinner("⚙️ Setting up model for the first time — this takes ~5 seconds..."):
+            model, vectorizer = load_artifacts()
     else:
-        with st.spinner("🧠 Analysing your message..."):
-            time.sleep(1.0)
-            result = predict_risk(user_input.strip(), model, vectorizer)
+            model, vectorizer = load_artifacts()
 
-        label    = result["label"]
+    # Input section
+    st.markdown('<div class="glass-card">', unsafe_allow_html=True)
+    st.markdown("### 💬 How are you feeling today?")
+
+    user_input = st.text_area(
+        label="Describe your thoughts, feelings, or recent experiences in your own words:",
+        placeholder=(
+            "e.g. 'I've been feeling overwhelmed lately and can't seem to relax. "
+            "My sleep has been poor and I find it hard to enjoy things...'"
+        ),
+        height=165,
+        key="user_input_area",
+    )
+
+    analyze_btn = st.button("🔍  Analyse My Mental State", key="analyze_btn")
+    st.markdown("</div>", unsafe_allow_html=True)
+
+    # ── Prediction and Results ────────────────────────────────────
+    if analyze_btn:
+        if not user_input.strip():
+            st.warning("⚠️  Please enter some text before clicking Analyse.")
+        elif len(user_input.strip().split()) < 2:
+            st.warning("⚠️  Please provide a bit more detail for an accurate assessment.")
+        else:
+            with st.spinner("🧠 Analysing your message..."):
+                time.sleep(1.0)
+                result = predict_risk(user_input.strip(), model, vectorizer)
+
+            label    = result["label"]
         probs    = result["probabilities"]
         conf     = probs[label] * 100
         override = result["override"]
@@ -647,6 +852,23 @@ if analyze_btn:
             )
         st.markdown(f"<div class='glass-card'>{html}</div>", unsafe_allow_html=True)
 
+        # ── Save to history ──────────────────────────────────
+        suggestions_to_save = {
+            "emoji": info["emoji"],
+            "headline": info["headline"],
+            "intro": info["intro"],
+            "items": info["items"]
+        }
+        save_to_history(
+            statement=user_input.strip(),
+            risk_level=label,
+            confidence=conf if not override else 100.0,
+            suggestions=suggestions_to_save,
+            override=override
+        )
+        
+        st.success("✅ Analysis saved to history", icon="✅")
+
         # ── Disclaimer ────────────────────────────────────────
         st.markdown(
             "<div class='disclaimer'>"
@@ -659,11 +881,11 @@ if analyze_btn:
             unsafe_allow_html=True,
         )
 
-# Footer
-if not analyze_btn:
-    st.markdown(
-        "<div class='footer-txt'>"
-        "🔒 Your text is processed locally and is never stored or transmitted."
-        "</div>",
-        unsafe_allow_html=True,
-    )
+    # Footer
+    if not analyze_btn:
+        st.markdown(
+            "<div class='footer-txt'>"
+            "🔒 Your text is processed locally and is never stored or transmitted."
+            "</div>",
+            unsafe_allow_html=True,
+        )
